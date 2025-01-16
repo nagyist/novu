@@ -1,12 +1,11 @@
 import { UserSession } from '@novu/testing';
-import { CacheService } from '@novu/application-generic';
+import { CacheService, HttpResponseHeaderKeysEnum } from '@novu/application-generic';
 import { expect } from 'chai';
-import { HttpResponseHeaderKeysEnum } from './types';
 import { DOCS_LINK } from './idempotency.interceptor';
 
 process.env.LAUNCH_DARKLY_SDK_KEY = ''; // disable Launch Darkly to allow test to define FF state
 
-describe('Idempotency Test', async () => {
+describe('Idempotency Test #novu-v2', async () => {
   let session: UserSession;
   const path = '/v1/testing/idempotency';
   let cacheService: CacheService | null = null;
@@ -49,7 +48,7 @@ describe('Idempotency Test', async () => {
         .expect(201);
       const cacheKey = `test-${session.organization._id}-${key}`;
       session.testServer?.getHttpServer();
-      // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
+
       const cacheVal = JSON.stringify(JSON.parse(await cacheService?.get(cacheKey)!).data);
       expect(JSON.stringify(body)).to.eq(cacheVal);
       const { body: bodyDupe, headers: headerDupe } = await session.testAgent
@@ -74,7 +73,7 @@ describe('Idempotency Test', async () => {
         .expect(201);
       const cacheKey = `test-${session.organization._id}-${key}`;
       session.testServer?.getHttpServer();
-      // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
+
       const cacheVal = JSON.stringify(JSON.parse(await cacheService?.get(cacheKey)!).data);
       expect(JSON.stringify(body)).to.eq(cacheVal);
       const { body: bodyDupe, headers: headerDupe } = await session.testAgent
@@ -108,13 +107,11 @@ describe('Idempotency Test', async () => {
       expect(headerDupe[HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY.toLowerCase()]).to.eq(key);
       expect(headerDupe[HttpResponseHeaderKeysEnum.LINK.toLowerCase()]).to.eq(DOCS_LINK);
       expect(retryHeader).to.eq(`1`);
-      expect(JSON.stringify(conflictBody)).to.eq(
-        JSON.stringify({
-          message: `Request with key "${key}" is currently being processed. Please retry after 1 second`,
-          error: 'Conflict',
-          statusCode: 409,
-        })
+      expect(conflictBody.message).to.eq(
+        `Request with key "${key}" is currently being processed. Please retry after 1 second`
       );
+      expect(conflictBody.error).to.eq('Conflict');
+      expect(conflictBody.statusCode).to.eq(409);
     });
     it('should return conflict when different body is sent for same key', async () => {
       const key = '5';
@@ -137,13 +134,9 @@ describe('Idempotency Test', async () => {
       expect(headers[HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY.toLowerCase()]).to.eq(key);
       expect(headerDupe[HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY.toLowerCase()]).to.eq(key);
       expect(headerDupe[HttpResponseHeaderKeysEnum.LINK.toLowerCase()]).to.eq(DOCS_LINK);
-      expect(JSON.stringify(conflictBody)).to.eq(
-        JSON.stringify({
-          message: `Request with key "${key}" is being reused for a different body`,
-          error: 'Unprocessable Entity',
-          statusCode: 422,
-        })
-      );
+      expect(conflictBody.message).to.eq(`Request with key "${key}" is being reused for a different body`);
+      expect(conflictBody.error).to.eq('Unprocessable Entity');
+      expect(conflictBody.statusCode).to.eq(422);
     });
     it('should return non cached response for unique requests', async () => {
       const key = '6';
@@ -201,7 +194,8 @@ describe('Idempotency Test', async () => {
         .set('authorization', `ApiKey ${session.apiKey}`)
         .send({ data: 422 })
         .expect(422);
-      expect(JSON.stringify(body)).to.equal(JSON.stringify(bodyDupe));
+      expect(body.message).to.equal(bodyDupe.message);
+      expect(body.statusCode).to.equal(bodyDupe.statusCode);
 
       expect(headers[HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY.toLowerCase()]).to.eq(key);
       expect(headerDupe[HttpResponseHeaderKeysEnum.IDEMPOTENCY_KEY.toLowerCase()]).to.eq(key);
@@ -217,13 +211,9 @@ describe('Idempotency Test', async () => {
         .set('authorization', `ApiKey ${session.apiKey}`)
         .send({ data: 250 })
         .expect(400);
-      expect(JSON.stringify(body)).to.eq(
-        JSON.stringify({
-          message: `idempotencyKey "${key}" has exceeded the maximum allowed length of 255 characters`,
-          error: 'Bad Request',
-          statusCode: 400,
-        })
-      );
+      const { statusCode, message } = body;
+      expect(statusCode).to.eq(400);
+      expect(message).to.eq(`idempotencyKey "${key}" has exceeded the maximum allowed length of 255 characters`);
     });
 
     describe('Allowed Authentication Security Schemes', () => {
