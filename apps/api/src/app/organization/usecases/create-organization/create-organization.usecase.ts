@@ -1,20 +1,20 @@
-import { BadRequestException, Inject, Injectable, Logger, Scope } from '@nestjs/common';
-import { OrganizationEntity, OrganizationRepository, UserRepository } from '@novu/dal';
-import { ApiServiceLevelEnum, JobTitleEnum, MemberRoleEnum } from '@novu/shared';
+/* eslint-disable global-require */
+import { BadRequestException, Injectable, Logger, Scope } from '@nestjs/common';
 import { AnalyticsService } from '@novu/application-generic';
+import { OrganizationEntity, OrganizationRepository, UserRepository } from '@novu/dal';
+import { ApiServiceLevelEnum, EnvironmentEnum, JobTitleEnum, MemberRoleEnum } from '@novu/shared';
 
-import { CreateEnvironmentCommand } from '../../../environments/usecases/create-environment/create-environment.command';
-import { CreateEnvironment } from '../../../environments/usecases/create-environment/create-environment.usecase';
+import { ModuleRef } from '@nestjs/core';
+import { CreateEnvironmentCommand } from '../../../environments-v1/usecases/create-environment/create-environment.command';
+import { CreateEnvironment } from '../../../environments-v1/usecases/create-environment/create-environment.usecase';
 import { GetOrganizationCommand } from '../get-organization/get-organization.command';
 import { GetOrganization } from '../get-organization/get-organization.usecase';
 import { AddMemberCommand } from '../membership/add-member/add-member.command';
 import { AddMember } from '../membership/add-member/add-member.usecase';
 import { CreateOrganizationCommand } from './create-organization.command';
 
-import { ApiException } from '../../../shared/exceptions/api.exception';
 import { CreateNovuIntegrations } from '../../../integrations/usecases/create-novu-integrations/create-novu-integrations.usecase';
-import { CreateNovuIntegrationsCommand } from '../../../integrations/usecases/create-novu-integrations/create-novu-integrations.command';
-import { ModuleRef } from '@nestjs/core';
+import { ApiException } from '../../../shared/exceptions/api.exception';
 
 @Injectable({
   scope: Scope.REQUEST,
@@ -40,7 +40,7 @@ export class CreateOrganization {
       name: command.name,
       apiServiceLevel: ApiServiceLevelEnum.FREE,
       domain: command.domain,
-      productUseCases: command.productUseCases,
+      language: command.language,
     });
 
     if (command.jobTitle) {
@@ -58,33 +58,19 @@ export class CreateOrganization {
     const devEnv = await this.createEnvironmentUsecase.execute(
       CreateEnvironmentCommand.create({
         userId: user._id,
-        name: 'Development',
+        name: EnvironmentEnum.DEVELOPMENT,
         organizationId: createdOrganization._id,
+        system: true,
       })
     );
 
-    await this.createNovuIntegrations.execute(
-      CreateNovuIntegrationsCommand.create({
-        environmentId: devEnv._id,
-        organizationId: devEnv._organizationId,
-        userId: user._id,
-      })
-    );
-
-    const prodEnv = await this.createEnvironmentUsecase.execute(
+    await this.createEnvironmentUsecase.execute(
       CreateEnvironmentCommand.create({
         userId: user._id,
-        name: 'Production',
+        name: EnvironmentEnum.PRODUCTION,
         organizationId: createdOrganization._id,
         parentEnvironmentId: devEnv._id,
-      })
-    );
-
-    await this.createNovuIntegrations.execute(
-      CreateNovuIntegrationsCommand.create({
-        environmentId: prodEnv._id,
-        organizationId: prodEnv._organizationId,
-        userId: user._id,
+        system: true,
       })
     );
 
@@ -92,6 +78,8 @@ export class CreateOrganization {
 
     this.analyticsService.track('[Authentication] - Create Organization', user._id, {
       _organization: createdOrganization._id,
+      language: command.language,
+      creatorJobTitle: command.jobTitle,
     });
 
     const organizationAfterChanges = await this.getOrganizationUsecase.execute(
@@ -115,7 +103,7 @@ export class CreateOrganization {
       },
       {
         $set: {
-          jobTitle: jobTitle,
+          jobTitle,
         },
       }
     );
@@ -129,9 +117,11 @@ export class CreateOrganization {
         if (!require('@novu/ee-billing')?.StartReverseFreeTrial) {
           throw new BadRequestException('Billing module is not loaded');
         }
+
         const usecase = this.moduleRef.get(require('@novu/ee-billing')?.StartReverseFreeTrial, {
           strict: false,
         });
+
         await usecase.execute({
           userId,
           organizationId,
