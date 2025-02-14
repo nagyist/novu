@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { MessageEntity, MessageRepository, SubscriberRepository, SubscriberEntity, MemberRepository } from '@novu/dal';
-import { ChannelTypeEnum, WebSocketEventEnum } from '@novu/shared';
+import { MessageEntity, MessageRepository, SubscriberRepository, SubscriberEntity } from '@novu/dal';
+import { INVITE_TEAM_MEMBER_NUDGE_PAYLOAD_KEY, WebSocketEventEnum } from '@novu/shared';
 import {
   WebSocketsQueueService,
   AnalyticsService,
@@ -20,8 +20,7 @@ export class MarkMessageAs {
     private messageRepository: MessageRepository,
     private webSocketsQueueService: WebSocketsQueueService,
     private analyticsService: AnalyticsService,
-    private subscriberRepository: SubscriberRepository,
-    private memberRepository: MemberRepository
+    private subscriberRepository: SubscriberRepository
   ) {}
 
   async execute(command: MarkMessageAsCommand): Promise<MessageEntity[]> {
@@ -54,7 +53,6 @@ export class MarkMessageAs {
         $in: command.messageIds,
       },
     });
-
     if (command.mark.seen != null) {
       await this.updateServices(command, subscriber, messages, MarkEnum.SEEN);
     }
@@ -91,6 +89,19 @@ export class MarkMessageAs {
       groupId: subscriber._organizationId,
     });
   }
+
+  private async sendAnalyticsEventForInviteTeamNudge(messages: MessageEntity[]) {
+    const inviteTeamMemberNudgeMessage = messages.find(
+      (message) => message?.payload[INVITE_TEAM_MEMBER_NUDGE_PAYLOAD_KEY] === true
+    );
+
+    if (inviteTeamMemberNudgeMessage) {
+      this.analyticsService.track('Invite Nudge Seen', inviteTeamMemberNudgeMessage._subscriberId, {
+        _organization: inviteTeamMemberNudgeMessage._organizationId,
+      });
+    }
+  }
+
   @CachedEntity({
     builder: (command: { subscriberId: string; _environmentId: string }) =>
       buildSubscriberKey({

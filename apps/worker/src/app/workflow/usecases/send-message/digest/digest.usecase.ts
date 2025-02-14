@@ -1,5 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { MessageRepository, JobRepository, JobStatusEnum, JobEntity } from '@novu/dal';
+import {
+  MessageRepository,
+  JobRepository,
+  JobStatusEnum,
+  JobEntity,
+  EnvironmentEntity,
+  OrganizationEntity,
+  UserEntity,
+} from '@novu/dal';
 import {
   StepTypeEnum,
   ExecutionDetailsSourceEnum,
@@ -10,7 +18,7 @@ import {
 } from '@novu/shared';
 import {
   DetailEnum,
-  GetFeatureFlag,
+  GetFeatureFlagService,
   GetFeatureFlagCommand,
   ExecutionLogRoute,
   ExecutionLogRouteCommand,
@@ -19,7 +27,6 @@ import {
 import { GetDigestEventsRegular } from './get-digest-events-regular.usecase';
 import { GetDigestEventsBackoff } from './get-digest-events-backoff.usecase';
 
-import { CreateLog } from '../../../../shared/logs';
 import { PlatformException } from '../../../../shared/utils';
 
 import { SendMessageCommand } from '../send-message.command';
@@ -32,25 +39,24 @@ const LOG_CONTEXT = 'Digest';
 export class Digest extends SendMessageType {
   constructor(
     protected messageRepository: MessageRepository,
-    protected createLogUsecase: CreateLog,
     protected executionLogRoute: ExecutionLogRoute,
     protected jobRepository: JobRepository,
     private getDigestEventsRegular: GetDigestEventsRegular,
     private getDigestEventsBackoff: GetDigestEventsBackoff,
-    private getFeatureFlag: GetFeatureFlag
+    private getFeatureFlagService: GetFeatureFlagService
   ) {
-    super(messageRepository, createLogUsecase, executionLogRoute);
+    super(messageRepository, executionLogRoute);
   }
 
   public async execute(command: SendMessageCommand) {
     const currentJob = await this.getCurrentJob(command);
 
-    const useMergedDigestId = await this.getFeatureFlag.execute(
+    const useMergedDigestId = await this.getFeatureFlagService.getBoolean(
       GetFeatureFlagCommand.create({
         key: FeatureFlagsKeysEnum.IS_USE_MERGED_DIGEST_ID_ENABLED,
-        environmentId: command.environmentId,
-        organizationId: command.organizationId,
-        userId: command.userId,
+        environment: { _id: command.environmentId } as EnvironmentEntity,
+        organization: { _id: command.organizationId } as OrganizationEntity,
+        user: { _id: command.userId } as UserEntity,
       })
     );
 
@@ -124,7 +130,7 @@ export class Digest extends SendMessageType {
 
     if (!currentJob) {
       const message = `Digest job ${command.jobId} is not found`;
-      Logger.error(message, LOG_CONTEXT);
+      Logger.log(message, LOG_CONTEXT);
       throw new PlatformException(message);
     }
 

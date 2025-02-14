@@ -1,17 +1,19 @@
-import { Controller, Get, UseGuards } from '@nestjs/common';
-import { UserAuthGuard } from '../auth/framework/user.auth.guard';
+import { Controller, Get } from '@nestjs/common';
+import { ApiExcludeController } from '@nestjs/swagger';
 import { ExternalApiAccessible } from '../auth/framework/external-api.decorator';
+import { UserAuthentication } from '../shared/framework/swagger/api.key.security';
 
 @Controller('/test-auth')
+@ApiExcludeController()
 export class TestApiAuthController {
   @ExternalApiAccessible()
-  @UseGuards(UserAuthGuard)
+  @UserAuthentication()
   @Get('/user-route')
   userRoute() {
     return true;
   }
 
-  @UseGuards(UserAuthGuard)
+  @UserAuthentication()
   @Get('/user-api-inaccessible-route')
   userInaccessibleRoute() {
     return true;
