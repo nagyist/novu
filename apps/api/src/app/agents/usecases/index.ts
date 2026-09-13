@@ -14,6 +14,9 @@ import { HandleAgentReply } from '../conversation-runtime/reply/handle-agent-rep
 import { HandlePlanProgress } from '../conversation-runtime/reply/handle-plan-progress/handle-plan-progress.usecase';
 import { SendAgentWelcomeMessage } from '../conversation-runtime/reply/send-agent-welcome-message/send-agent-welcome-message.usecase';
 import { SendAgentTestEmail } from '../email/send-agent-test-email/send-agent-test-email.usecase';
+import { ResumeToolApprovalFromHitl } from '../human-relay/resume-tool-approval-from-hitl.usecase';
+import { HandleNovuHuman } from '../managed-runtime/novu-human/handle-novu-human.usecase';
+import { ResumeManagedHuman } from '../managed-runtime/novu-human/resume-managed-human.usecase';
 import { HandleNovuResolve } from '../managed-runtime/novu-resolve/handle-novu-resolve.usecase';
 import { ConfirmToolApproval } from '../managed-runtime/tool-approval/confirm-tool-approval.usecase';
 import { HandlePendingToolApprovals } from '../managed-runtime/tool-approval/handle-pending-tool-approvals.usecase';
@@ -98,6 +101,9 @@ export const USE_CASES = [
   ConfirmToolApproval,
   HandleNovuTools,
   HandleNovuResolve,
+  HandleNovuHuman,
+  ResumeManagedHuman,
+  ResumeToolApprovalFromHitl,
   IngestAgentEvents,
   GetWebChatConversation,
   ListWebChatConversations,

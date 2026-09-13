@@ -1,6 +1,6 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import {
-  CreateStepConditionsPassedDetail,
+  CreateStepConditionEvaluationDetail,
   emailControlSchema,
   evaluateRules,
   extractRuleVariables,
@@ -27,6 +27,7 @@ import {
   ActionStep,
   ChannelStep,
   ChatOutputUnvalidated,
+  CustomStep,
   PostActionEnum,
   Schema,
   Step,
@@ -90,7 +91,7 @@ export class ConstructFrameworkWorkflow {
     private throttleOutputRendererUseCase: ThrottleOutputRendererUsecase,
     private inMemoryLRUCacheService: InMemoryLRUCacheService,
     private jobRepository: JobRepository,
-    private createStepConditionsPassedDetail: CreateStepConditionsPassedDetail
+    private createStepConditionEvaluationDetail: CreateStepConditionEvaluationDetail
   ) {
     this.logger.setContext(this.constructor.name);
   }
@@ -411,20 +412,13 @@ export class ConstructFrameworkWorkflow {
        * the workflow graph correctly. The resolve function is a passthrough because execution already happened.
        */
       case StepTypeEnum.HTTP_REQUEST:
-        return step.custom(
-          stepId,
-          async (controlValues) => {
-            return controlValues;
-          },
-          this.constructActionStepOptions(staticStep, skip)
-        );
       case StepTypeEnum.CUSTOM:
         return step.custom(
           stepId,
           async (controlValues) => {
             return controlValues;
           },
-          this.constructActionStepOptions(staticStep, skip)
+          this.constructCustomStepOptions(staticStep, skip)
         );
       default:
         throw new InternalServerErrorException(`Step type ${stepType} is not supported`);
@@ -540,6 +534,24 @@ export class ConstructFrameworkWorkflow {
     } as Required<Parameters<ChannelStep>[2]>;
   }
 
+  /**
+   * Worker-executed steps (HTTP request, custom) are hydrated from the job state when a later step
+   * calls the bridge, and the framework validates that state against the step's output schema with
+   * AJV configured to remove additional properties. Without an explicit schema the framework falls
+   * back to a closed empty schema, which strips the whole response body and leaves conditions such
+   * as `steps.http-request-step.enrolmentCount equals 1` evaluating against nothing (NV-8604).
+   */
+  @Instrument()
+  private constructCustomStepOptions(
+    staticStep: NotificationStepEntity,
+    skip: SkipFunction
+  ): NonNullable<Parameters<CustomStep>[2]> {
+    return {
+      ...this.constructActionStepOptions(staticStep, skip),
+      outputSchema: PERMISSIVE_EMPTY_SCHEMA as unknown as Schema,
+    };
+  }
+
   @Instrument()
   private constructActionStepOptions(
     staticStep: NotificationStepEntity,
@@ -653,9 +665,12 @@ export class ConstructFrameworkWorkflow {
     // The Step Conditions in the Dashboard control the step execution, that's why we need to invert the result.
     const shouldSkip = !result;
 
-    if (!shouldSkip) {
-      await this.traceConditionsPassed(skipRules, evaluationData, skipContext);
-    }
+    await this.traceConditionsEvaluated({
+      conditions: skipRules,
+      evaluationData,
+      skipContext,
+      passed: !shouldSkip,
+    });
 
     return shouldSkip;
   }
@@ -666,12 +681,18 @@ export class ConstructFrameworkWorkflow {
    * absent for preview/test constructions, where no trace should be written.
    * Failures are swallowed: tracing must never break a send.
    */
-  private async traceConditionsPassed(
-    skipRules: RulesLogic<AdditionalOperation>,
-    evaluationData: FullPayloadForRender,
-    { jobId, organizationId, environmentId }: ISkipEvaluationContext
-  ): Promise<void> {
-    if (!jobId || !(await this.createStepConditionsPassedDetail.isEnabled({ organizationId, environmentId }))) {
+  private async traceConditionsEvaluated({
+    conditions,
+    evaluationData,
+    skipContext: { jobId, organizationId, environmentId },
+    passed,
+  }: {
+    conditions: RulesLogic<AdditionalOperation>;
+    evaluationData: FullPayloadForRender;
+    skipContext: ISkipEvaluationContext;
+    passed: boolean;
+  }): Promise<void> {
+    if (!jobId || !(await this.createStepConditionEvaluationDetail.isEnabled({ organizationId, environmentId }))) {
       return;
     }
 
@@ -681,13 +702,14 @@ export class ConstructFrameworkWorkflow {
         return;
       }
 
-      await this.createStepConditionsPassedDetail.execute({
+      await this.createStepConditionEvaluationDetail.executeAfterEnabledCheck({
         job,
-        conditions: skipRules,
-        evaluatedValues: extractRuleVariables(skipRules, evaluationData),
+        conditions,
+        evaluatedValues: extractRuleVariables(conditions, evaluationData),
+        passed,
       });
     } catch (error) {
-      this.logger.error({ err: error }, 'Failed to create step conditions passed execution detail', LOG_CONTEXT);
+      this.logger.error({ err: error }, 'Failed to create step conditions execution detail', LOG_CONTEXT);
     }
   }
 }

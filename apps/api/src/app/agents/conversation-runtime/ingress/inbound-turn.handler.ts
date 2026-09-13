@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, type OnModuleInit } from '@nestjs/common';
 import { AnalyticsService, PinoLogger } from '@novu/application-generic';
-import type { WebChatRawMessage } from '@novu/chat-adapter-web';
+import { isValidActionIdempotencyKey, type WebChatRawMessage } from '@novu/chat-adapter-web-chat';
 import {
   AgentIntegrationRepository,
   AgentRepository,
@@ -9,15 +9,12 @@ import {
   ConversationActivitySenderTypeEnum,
   ConversationEntity,
   ConversationParticipantTypeEnum,
-  MessageEntity,
-  MessageRepository,
-  NotificationRepository,
   SubscriberRepository,
 } from '@novu/dal';
 import type { AgentAction } from '@novu/framework';
 import { parseApprovalActionId } from '@novu/framework/internal';
-import { ENDPOINT_TYPES } from '@novu/shared';
-import type { CardElement, EmojiValue, Message, Thread } from 'chat';
+import { ENDPOINT_TYPES, isDashboardWebChatSubscriberId } from '@novu/shared';
+import type { CardElement, EmojiValue, Message, MessageContext, Thread } from 'chat';
 import { ConnectClaimTokenService } from '../../../connect/services/connect-claim-token.service';
 import { parsePositiveIntEnv } from '../../../keyless/keyless-abuse.constants';
 import { KeylessAbuseGuardService } from '../../../keyless/keyless-abuse-guard.service';
@@ -27,6 +24,7 @@ import { LinkTelegramChatToSubscriber } from '../../../telegram-linking/link-tel
 import { agentTelegramLinkScope } from '../../../telegram-linking/telegram-link-scope';
 import { TelegramStartCodeService } from '../../../telegram-linking/telegram-start-code.service';
 import { ResolvedAgentConfig } from '../../channels/agent-config-resolver.service';
+import { HumanConversationInboundInterceptor } from '../../human-relay/human-conversation-inbound.interceptor';
 import {
   trackAgentInboundAction,
   trackAgentInboundMessage,
@@ -37,10 +35,12 @@ import { AgentEventEnum } from '../../shared/enums/agent-event.enum';
 import { AgentPlatformEnum } from '../../shared/enums/agent-platform.enum';
 import { captureAgentException, captureAgentWarning } from '../../shared/errors/capture-agent-sentry';
 import { parseToolApprovalActionId } from '../../shared/tool-approval/action-id';
+import { parseApprovalReplyVerdict } from '../../shared/tool-approval/reply-based-approval';
 import { getResolvedSubscriberId, type SubscriberResolution } from '../../shared/types/subscriber-resolution';
 import { agentLinkAwaitingInboundConnectionFilter } from '../../shared/util/agent-inbound-connection';
 import { extractMsTeamsTenantId } from '../../shared/util/msteams-activity';
 import { type AutoProvisionPlatform, shouldAutoProvisionInbound } from '../../shared/util/platform-endpoint-config';
+import { asRecord } from '../../shared/util/raw-record';
 import { extractWorkspaceId } from '../../shared/util/workspace-id';
 import { InboundAckService } from '../ack/inbound-ack.service';
 import { AgentAttachmentStorage, type StoredAttachment } from '../conversation/agent-attachment-storage.service';
@@ -59,6 +59,7 @@ import { InboundDispatcher } from './inbound.dispatcher';
 import { InboundConnectionContextResolver } from './inbound-connection-context.resolver';
 import { isLinkButtonActionId, PlanLimitGateService } from './plan-limit-gate.service';
 import { ReplyApprovalInterceptor } from './reply-approval-interceptor.service';
+import { WorkflowOriginService } from './workflow-origin.service';
 
 /**
  * `/start <payload>` is Telegram's deep-link mechanism. Telegram delivers it as
@@ -82,21 +83,6 @@ function extractTelegramChatId(thread: Thread): string | null {
   // `telegram:` prefix before persistence so the value we store matches what
   // `TelegramChatProvider.sendMessage` will POST to the bot API.
   return raw.startsWith('telegram:') ? raw.slice('telegram:'.length) : raw;
-}
-
-const WORKFLOW_ORIGIN_CONTENT_MAX_CHARS = 2_000;
-
-function buildWorkflowOriginSummary(
-  workflowIdentifier: string,
-  messageContent: string,
-  payload: Record<string, unknown>
-): string {
-  const message =
-    messageContent.length > 0 ? messageContent : `A notification was sent by the ${workflowIdentifier} workflow.`;
-  const additionalData =
-    Object.keys(payload).length > 0 ? `\n\nAdditional data for this message:\n${JSON.stringify(payload, null, 2)}` : '';
-
-  return `${message}${additionalData}`.slice(0, WORKFLOW_ORIGIN_CONTENT_MAX_CHARS);
 }
 
 const SUBSCRIBER_LINK_SUCCESS_REPLY = "You're connected. Notifications from this agent will now reach you here.";
@@ -148,12 +134,42 @@ function buildCapacityReachedCard(platform: AutoProvisionPlatform): CardElement 
   };
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== 'object') {
-    return undefined;
+/**
+ * Chat SDK burst locks are scoped to the thread/channel, not the author (see
+ * `getLockKey`), so a burst can hold messages from different senders — multiple
+ * participants in a subscribed Slack/Teams thread, or anyone in a Telegram/WhatsApp
+ * group (channel-scoped lock by default). Subscriber resolution, tool-approval actor
+ * identity, and persistence all key off the latest message's author, so a different
+ * author's text/attachments must never be folded in — that would let one participant's
+ * message run under another's identity and permissions.
+ *
+ * A lone whole-message reply verdict (e.g. "yes") is also kept as-is rather than
+ * folded: `parseApprovalReplyVerdict` only recognizes an exact match, so combining it
+ * with adjacent text would silently drop a pending tool approval.
+ */
+function foldInboundBurst(message: Message, messageContext?: MessageContext): void {
+  if (!messageContext?.skipped?.length) {
+    return;
   }
 
-  return value as Record<string, unknown>;
+  const sameAuthor = messageContext.skipped.filter((item) => item.author.userId === message.author.userId);
+  if (sameAuthor.length === 0) {
+    return;
+  }
+
+  const burst = [...sameAuthor, message];
+  const verdict = burst.find((item) => parseApprovalReplyVerdict(item.text) !== null);
+  if (verdict) {
+    message.text = verdict.text;
+
+    return;
+  }
+
+  message.text = burst
+    .map((item) => item.text ?? '')
+    .filter((text) => text.trim().length > 0)
+    .join('\n\n');
+  message.attachments = burst.flatMap((item) => item.attachments ?? []);
 }
 
 function getMessageRawEvent(message: Message): Record<string, unknown> | undefined {
@@ -214,29 +230,6 @@ function getActionPlatformThreadId(platform: AgentPlatformEnum, thread: Thread, 
   }
 
   return `${thread.id}${action.sourceMessageId}`;
-}
-
-/** Conversation uses `slack:{channel}:{ts}`; Message.identifier stores bare `{channel}:{ts}`. */
-function toProviderMessageLookupKey(platformThreadId: string): string {
-  return platformThreadId.startsWith('slack:') ? platformThreadId.slice('slack:'.length) : platformThreadId;
-}
-
-/** Decoded Novu Message._id from a trailing `+nv{base36}` Reply-To token on the inbound recipient. */
-function extractAgentEmailOriginToken(message: Message): string | null {
-  const raw = asRecord(message.raw);
-  const originToken = raw?.originToken;
-
-  return typeof originToken === 'string' && originToken.length > 0 ? originToken.toLowerCase() : null;
-}
-
-/** Slack provider id is `{channel}:{ts}` — channel ids never contain `:`. */
-function platformMessageIdFromProviderIdentifier(identifier: string): string | undefined {
-  const colon = identifier.indexOf(':');
-  if (colon <= 0 || colon === identifier.length - 1) {
-    return undefined;
-  }
-
-  return identifier.slice(colon + 1);
 }
 
 function mapStoredAttachmentsFromRichContent(richContent?: Record<string, unknown>): StoredAttachment[] {
@@ -319,16 +312,16 @@ export class AgentInboundHandler implements OnModuleInit {
     private readonly inboundAck: InboundAckService,
     private readonly connectionContextResolver: InboundConnectionContextResolver,
     private readonly replyApprovalInterceptor: ReplyApprovalInterceptor,
-    private readonly notificationRepository: NotificationRepository,
-    private readonly messageRepository: MessageRepository
+    private readonly workflowOriginService: WorkflowOriginService,
+    private readonly humanConversationInbound: HumanConversationInboundInterceptor
   ) {
     this.logger.setContext(this.constructor.name);
   }
 
   onModuleInit() {
     this.inboundDispatcher.registerInboundCallbacks({
-      onMessage: (agentId, config, thread, message) =>
-        this.handle(agentId, config, thread, message, AgentEventEnum.ON_MESSAGE),
+      onMessage: (agentId, config, thread, message, messageContext) =>
+        this.handle(agentId, config, thread, message, AgentEventEnum.ON_MESSAGE, messageContext),
       onAction: (agentId, config, thread, action, userId, rawEvent) =>
         this.handleAction(agentId, config, thread, action, userId, rawEvent),
       onReaction: (agentId, config, event) => this.handleReaction(agentId, config, event),
@@ -340,115 +333,36 @@ export class AgentInboundHandler implements OnModuleInit {
     config: ResolvedAgentConfig,
     thread: Thread,
     message: Message,
-    event: AgentEventEnum
+    event: AgentEventEnum,
+    messageContext?: MessageContext
   ): Promise<void> {
-    if (await this.consumeTelegramStartLink(agentId, config, thread, message)) {
+    if (await this.consumeTelegramStartLink(agentId, config, thread, message, messageContext)) {
       return;
     }
+
+    foldInboundBurst(message, messageContext);
 
     if (await this.planLimitGate.maybeBlock(agentId, config, thread)) {
       return;
     }
 
-    const emailAuthRaw = config.platform === AgentPlatformEnum.EMAIL ? asRecord(message.raw) : undefined;
-    const isVerifiedEmailSender =
-      config.platform !== AgentPlatformEnum.EMAIL || isInboundEmailSenderVerified(emailAuthRaw);
-
-    // Open-access agents may lookup-or-provision; restricted stay lookup-only.
-    // Keyless email demos stay lookup-only until tool approval.
-    const telegramChatId = config.platform === AgentPlatformEnum.TELEGRAM ? extractTelegramChatId(thread) : undefined;
-    const canAutoProvision = shouldAutoProvisionInbound({
-      platform: config.platform,
-      subscriberAccess: config.subscriberAccess,
-      isManaged: config.isManaged,
-      isKeyless: config.isKeyless,
-      isTelegramDm: telegramChatId != null && telegramChatId === message.author.userId,
-    });
-
-    let resolution: SubscriberResolution;
-    try {
-      if (!isVerifiedEmailSender) {
-        this.logger.warn(
-          {
-            agentId,
-            organizationId: config.organizationId,
-            environmentId: config.environmentId,
-            fromAddress: message.author.userId,
-            dkim: emailAuthRaw?.dkim,
-            spf: emailAuthRaw?.spf,
-            messageId: message.id,
-            subscriberAccess: config.subscriberAccess,
-            isKeyless: config.isKeyless,
-            canAutoProvision,
-          },
-          'Inbound email sender failed DKIM/SPF verification — skipping subscriber resolution so a spoofed From cannot assume an existing identity.'
-        );
-        resolution = { outcome: 'not_found' };
-      } else if (canAutoProvision) {
-        resolution = await this.subscriberResolver.resolveOrProvision({
-          environmentId: config.environmentId,
-          organizationId: config.organizationId,
-          platform: config.platform,
-          platformUserId: message.author.userId,
-          integrationIdentifier: config.integrationIdentifier,
-          agentIdentifier: config.agentIdentifier,
-          authorFullName: message.author.fullName,
-          authorUserName: message.author.userName,
-          // chat-sdk types isBot as `boolean | "unknown"`; treat anything except `true` as a non-bot author.
-          authorIsBot: message.author.isBot === true,
-          // Teams multi-tenant: capture the user's tenant from the inbound activity so the endpoint
-          // records which (possibly external customer) tenant the user belongs to.
-          platformTenantId:
-            config.platform === AgentPlatformEnum.TEAMS ? extractMsTeamsTenantId(message.raw) : undefined,
-        });
-      } else {
-        resolution = await this.resolveSubscriber({
-          agentId,
-          config,
-          platformUserId: message.author.userId,
-          operation: 'resolve-subscriber',
-          authorIsBot: message.author.isBot === true,
-        });
-      }
-    } catch (err) {
-      if (err instanceof BotAuthorSkippedError) {
-        this.logger.debug(
-          `[agent:${agentId}] Inbound from bot author ${config.platform}:${message.author.userId} skipped without dispatch`
-        );
-
-        return;
-      }
-
-      if (err instanceof ConnectOrgSubscriberCapExceededError) {
-        this.logger.warn(
-          { agentId, organizationId: config.organizationId, count: err.count, limit: err.limit },
-          'Connect org at auto-provisioned subscriber cap — posting tier-upgrade card and skipping dispatch.'
-        );
-        await this.postCapacityReachedReply(agentId, config, thread, message);
-
-        return;
-      }
-
-      /**
-       * Only `resolveOrProvision` on open-access Slack / Teams / Telegram /
-       * email / WhatsApp / Sendblue can reach here - the `resolveSubscriber` read path
-       * maps its own failures to an `error` outcome internally and never throws.
-       * For auto-provision platforms an unknown error means we don't know the
-       * subscriber state, so we keep dispatch off and surface the failure rather
-       * than silently degrading to a PLATFORM_USER participant the
-       * removed-anonymous-state contract was meant to eliminate.
-       */
-      captureAgentWarning(err, { component: 'agent-inbound-handler', operation: 'resolve-subscriber', agentId });
-
-      throw err;
+    const inboundSubscriber = await this.resolveInboundSubscriber(agentId, config, thread, message);
+    if (!inboundSubscriber) {
+      return;
     }
 
+    const { resolution, isVerifiedEmailSender } = inboundSubscriber;
     const subscriberId = getResolvedSubscriberId(resolution);
+    const isDashboardTester = isDashboardWebChatSubscriberId(subscriberId);
 
     // A genuine, non-bot user has messaged the agent (bot-authored echoes threw
     // `BotAuthorSkippedError` above). This — not the raw webhook POST — is what
     // marks the agent–integration link connected and completes onboarding.
-    await this.markIntegrationConnectedOnFirstMessage(agentId, config);
+    // The dashboard Web Chat tester uses a reserved subscriber the install
+    // prompt never copies, so those turns must not stamp Connected.
+    if (!isDashboardTester) {
+      await this.markIntegrationConnectedOnFirstMessage(agentId, config);
+    }
 
     const platformThreadId = getInboundPlatformThreadId(config.platform, thread, message);
 
@@ -472,12 +386,15 @@ export class AgentInboundHandler implements OnModuleInit {
       return;
     }
 
-    // Persist only after the gate. For an existing thread this reconciles
-    // participants and reopens a RESOLVED conversation; for a brand-new one it
-    // creates the Conversation that the gate just cleared.
-    const workflowOriginMessage = existingConversation
-      ? null
-      : await this.findWorkflowOriginMessage(agentId, config, platformThreadId, subscriberId, message);
+    const workflowOriginResolution = await this.workflowOriginService.resolve({
+      agentId,
+      config,
+      platformThreadId,
+      subscriberId,
+      message,
+      existingConversation,
+      isDirectMessage: thread.isDM,
+    });
 
     const conversation = await this.conversationService.createOrGetConversation({
       environmentId: config.environmentId,
@@ -495,120 +412,39 @@ export class AgentInboundHandler implements OnModuleInit {
       isDirectMessage: thread.isDM,
       workspaceId: extractWorkspaceId(config.platform, message.raw) ?? undefined,
       identifier: this.webChatConversationIdentifier(config.platform, platformThreadId),
-      notificationId: workflowOriginMessage?._notificationId,
+      notificationId: workflowOriginResolution?.notificationId,
       contextKeys:
         config.platform === AgentPlatformEnum.WEB_CHAT
           ? ((message.raw as WebChatRawMessage | undefined)?.contextKeys ?? [])
           : undefined,
     });
 
-    if (workflowOriginMessage) {
-      await this.hydrateWorkflowOrigin(agentId, config, conversation, platformThreadId, workflowOriginMessage);
-    }
-
-    if (config.isKeyless) {
-      const aiEnabled = await this.keylessAbuseGuard.isKeylessAgentAiEnabled(config.organizationId);
-
-      if (!aiEnabled) {
-        await this.postKeylessSignupCta(agentId, config, thread, conversation);
-
-        return;
-      }
-
-      if (await this.connectClaimTokenService.isSignupCtaPosted(conversation._id)) {
-        return;
-      }
-
-      if (await this.isKeylessDemoCapReached(config, conversation._id)) {
-        await this.postKeylessSignupCta(agentId, config, thread, conversation);
-
-        return;
-      }
-    }
-
-    const storedAttachments = await this.storeInboundAttachments(config, conversation, message);
-    const isFirstMessage = !this.conversationService.getPrimaryChannel(conversation).firstPlatformMessageId;
-
-    await this.recordInboundMessage(agentId, config, conversation, message, {
-      subscriberId,
-      platformThreadId,
-      storedAttachments,
-      event,
-      isFirstMessage,
-    });
-
-    const [subscriber, agent] = await Promise.all([
-      subscriberId
-        ? this.subscriberRepository.findBySubscriberId(config.environmentId, subscriberId)
-        : Promise.resolve(null),
-      this.agentRepository.findOne({ _id: agentId, _environmentId: config.environmentId }, [
-        '_id',
-        'runtime',
-        'managedRuntime',
-      ]),
-    ]);
-
-    // An id that resolved but whose Subscriber record cannot be loaded is an
-    // internal inconsistency, not a sender problem — reclassify so downstream
-    // gates reply with the transient copy instead of rejecting the sender.
-    if (resolution.outcome === 'resolved' && !subscriber) {
-      resolution = {
-        outcome: 'error',
-        err: new Error(`Subscriber record ${resolution.subscriberId} not found after resolution`),
-      };
-    }
-
-    const context = await this.connectionContextResolver.resolve(config, message.raw, message.author?.userId);
-
-    const runtime = this.runtimeResolver.resolve(agent);
-    const turn: ConversationTurn = {
+    const workflowOrigin = await this.workflowOriginService.resolveForTurn({
       agentId,
-      agent: agent ?? { _id: agentId },
       config,
       conversation,
-      subscriber,
-      context,
-      subscriberResolution: resolution,
+      platformThreadId,
+      subscriberId,
+      resolution: workflowOriginResolution,
+    });
+
+    if (await this.maybeStopKeylessInbound(agentId, config, thread, conversation)) {
+      return;
+    }
+
+    await this.dispatchInboundTurn({
+      agentId,
+      config,
+      thread,
       message,
       event,
-      thread,
+      conversation,
       platformThreadId,
-      storedAttachments: message.attachments?.length ? storedAttachments : undefined,
-    };
-
-    // On buttonless platforms (iMessage/SMS) a pending tool approval is
-    // answered by texting back YES / NO — consume before the subscriber-access
-    // gate so an unresolved/restricted sender can still settle a pending approval.
-    if (
-      event === AgentEventEnum.ON_MESSAGE &&
-      (await this.replyApprovalInterceptor.tryHandleAsApprovalReply(turn, runtime))
-    ) {
-      return;
-    }
-
-    if (
-      await maybeReplyUnresolvedSubscriberAccess({
-        turn,
-        logger: this.logger,
-        outboundGateway: this.outboundGateway,
-        conversationService: this.conversationService,
-        emailSenderUnverified: !isVerifiedEmailSender,
-      })
-    ) {
-      return;
-    }
-
-    if (!config.isManaged) {
-      await this.inboundAck.showWorkingSignal({
-        agentId,
-        config,
-        platformThreadId,
-        platformMessageId: message?.id,
-        isFirstMessage,
-      });
-    }
-
-    await runtime.dispatch(turn);
+      subscriberId,
+      resolution,
+      isVerifiedEmailSender,
+      workflowOrigin,
+    });
   }
 
   /**
@@ -658,23 +494,287 @@ export class AgentInboundHandler implements OnModuleInit {
     }
   }
 
+  private async resolveInboundSubscriber(
+    agentId: string,
+    config: ResolvedAgentConfig,
+    thread: Thread,
+    message: Message
+  ): Promise<{ resolution: SubscriberResolution; isVerifiedEmailSender: boolean } | null> {
+    const emailAuthRaw = config.platform === AgentPlatformEnum.EMAIL ? asRecord(message.raw) : undefined;
+    const isVerifiedEmailSender =
+      config.platform !== AgentPlatformEnum.EMAIL || isInboundEmailSenderVerified(emailAuthRaw);
+
+    // Open-access agents may lookup-or-provision; restricted stay lookup-only.
+    // Keyless email demos stay lookup-only until tool approval.
+    const telegramChatId = config.platform === AgentPlatformEnum.TELEGRAM ? extractTelegramChatId(thread) : undefined;
+    const canAutoProvision = shouldAutoProvisionInbound({
+      platform: config.platform,
+      subscriberAccess: config.subscriberAccess,
+      isManaged: config.isManaged,
+      isKeyless: config.isKeyless,
+      isTelegramDm: telegramChatId != null && telegramChatId === message.author.userId,
+    });
+
+    try {
+      if (!isVerifiedEmailSender) {
+        this.logger.warn(
+          {
+            agentId,
+            organizationId: config.organizationId,
+            environmentId: config.environmentId,
+            fromAddress: message.author.userId,
+            dkim: emailAuthRaw?.dkim,
+            spf: emailAuthRaw?.spf,
+            messageId: message.id,
+            subscriberAccess: config.subscriberAccess,
+            isKeyless: config.isKeyless,
+            canAutoProvision,
+          },
+          'Inbound email sender failed DKIM/SPF verification — skipping subscriber resolution so a spoofed From cannot assume an existing identity.'
+        );
+
+        return { resolution: { outcome: 'not_found' }, isVerifiedEmailSender };
+      }
+
+      if (canAutoProvision) {
+        return {
+          resolution: await this.subscriberResolver.resolveOrProvision({
+            environmentId: config.environmentId,
+            organizationId: config.organizationId,
+            platform: config.platform,
+            platformUserId: message.author.userId,
+            integrationIdentifier: config.integrationIdentifier,
+            agentIdentifier: config.agentIdentifier,
+            authorFullName: message.author.fullName,
+            authorUserName: message.author.userName,
+            // chat-sdk types isBot as `boolean | "unknown"`; treat anything except `true` as a non-bot author.
+            authorIsBot: message.author.isBot === true,
+            // Teams multi-tenant: capture the user's tenant from the inbound activity so the endpoint
+            // records which (possibly external customer) tenant the user belongs to.
+            platformTenantId:
+              config.platform === AgentPlatformEnum.TEAMS ? extractMsTeamsTenantId(message.raw) : undefined,
+          }),
+          isVerifiedEmailSender,
+        };
+      }
+
+      return {
+        resolution: await this.resolveSubscriber({
+          agentId,
+          config,
+          platformUserId: message.author.userId,
+          operation: 'resolve-subscriber',
+          authorIsBot: message.author.isBot === true,
+        }),
+        isVerifiedEmailSender,
+      };
+    } catch (err) {
+      if (err instanceof BotAuthorSkippedError) {
+        this.logger.debug(
+          `[agent:${agentId}] Inbound from bot author ${config.platform}:${message.author.userId} skipped without dispatch`
+        );
+
+        return null;
+      }
+
+      if (err instanceof ConnectOrgSubscriberCapExceededError) {
+        this.logger.warn(
+          { agentId, organizationId: config.organizationId, count: err.count, limit: err.limit },
+          'Connect org at auto-provisioned subscriber cap — posting tier-upgrade card and skipping dispatch.'
+        );
+        await this.postCapacityReachedReply(agentId, config, thread, message);
+
+        return null;
+      }
+
+      /**
+       * Only `resolveOrProvision` on open-access Slack / Teams / Telegram /
+       * email / WhatsApp / Sendblue can reach here - the `resolveSubscriber` read path
+       * maps its own failures to an `error` outcome internally and never throws.
+       * For auto-provision platforms an unknown error means we don't know the
+       * subscriber state, so we keep dispatch off and surface the failure rather
+       * than silently degrading to a PLATFORM_USER participant the
+       * removed-anonymous-state contract was meant to eliminate.
+       */
+      captureAgentWarning(err, { component: 'agent-inbound-handler', operation: 'resolve-subscriber', agentId });
+
+      throw err;
+    }
+  }
+
+  private async dispatchInboundTurn(args: {
+    agentId: string;
+    config: ResolvedAgentConfig;
+    thread: Thread;
+    message: Message;
+    event: AgentEventEnum;
+    conversation: ConversationEntity;
+    platformThreadId: string;
+    subscriberId: string | null;
+    resolution: SubscriberResolution;
+    isVerifiedEmailSender: boolean;
+    workflowOrigin: Awaited<ReturnType<WorkflowOriginService['resolveForTurn']>>;
+  }): Promise<void> {
+    const {
+      agentId,
+      config,
+      thread,
+      message,
+      event,
+      conversation,
+      platformThreadId,
+      subscriberId,
+      isVerifiedEmailSender,
+      workflowOrigin,
+    } = args;
+    let { resolution } = args;
+    const storedAttachments = await this.storeInboundAttachments(config, conversation, message);
+    const isFirstMessage = !this.conversationService.getPrimaryChannel(conversation).firstPlatformMessageId;
+
+    await this.recordInboundMessage(agentId, config, conversation, message, {
+      subscriberId,
+      platformThreadId,
+      storedAttachments,
+      event,
+      isFirstMessage,
+    });
+
+    const [subscriber, agent] = await Promise.all([
+      subscriberId
+        ? this.subscriberRepository.findBySubscriberId(config.environmentId, subscriberId)
+        : Promise.resolve(null),
+      this.agentRepository.findOne({ _id: agentId, _environmentId: config.environmentId }, [
+        '_id',
+        'runtime',
+        'managedRuntime',
+      ]),
+    ]);
+
+    // An id that resolved but whose Subscriber record cannot be loaded is an
+    // internal inconsistency, not a sender problem — reclassify so downstream
+    // gates reply with the transient copy instead of rejecting the sender.
+    if (resolution.outcome === 'resolved' && !subscriber) {
+      resolution = {
+        outcome: 'error',
+        err: new Error(`Subscriber record ${resolution.subscriberId} not found after resolution`),
+      };
+    }
+
+    const { context, bridgeUrl: bridgeUrlOverride } = await this.connectionContextResolver.resolve(
+      config,
+      message.raw,
+      message.author?.userId
+    );
+
+    const runtime = this.runtimeResolver.resolve(agent);
+    const turn: ConversationTurn = {
+      agentId,
+      agent: agent ?? { _id: agentId },
+      config,
+      conversation,
+      subscriber,
+      context,
+      bridgeUrlOverride,
+      subscriberResolution: resolution,
+      message,
+      event,
+      thread,
+      platformThreadId,
+      platformUserId: message.author.userId,
+      storedAttachments: message.attachments?.length ? storedAttachments : undefined,
+      workflowOrigin: workflowOrigin ?? undefined,
+    };
+
+    // On buttonless platforms (iMessage/SMS) a pending tool approval is
+    // answered by texting back YES / NO — consume before the subscriber-access
+    // gate so an unresolved/restricted sender can still settle a pending approval.
+    if (
+      event === AgentEventEnum.ON_MESSAGE &&
+      (await this.replyApprovalInterceptor.tryHandleAsApprovalReply(turn, runtime))
+    ) {
+      return;
+    }
+
+    if (event === AgentEventEnum.ON_MESSAGE && (await this.humanConversationInbound.tryHandleMessage(turn))) {
+      return;
+    }
+
+    if (
+      await maybeReplyUnresolvedSubscriberAccess({
+        turn,
+        logger: this.logger,
+        outboundGateway: this.outboundGateway,
+        conversationService: this.conversationService,
+        emailSenderUnverified: !isVerifiedEmailSender,
+      })
+    ) {
+      return;
+    }
+
+    if (!config.isManaged) {
+      await this.inboundAck.showWorkingSignal({
+        agentId,
+        config,
+        platformThreadId,
+        platformMessageId: message?.id,
+        isFirstMessage,
+      });
+    }
+
+    await runtime.dispatch(turn);
+  }
+
+  private async maybeStopKeylessInbound(
+    agentId: string,
+    config: ResolvedAgentConfig,
+    thread: Thread,
+    conversation: ConversationEntity
+  ): Promise<boolean> {
+    if (!config.isKeyless) {
+      return false;
+    }
+
+    const aiEnabled = await this.keylessAbuseGuard.isKeylessAgentAiEnabled(config.organizationId);
+
+    if (!aiEnabled) {
+      await this.postKeylessSignupCta(agentId, config, thread, conversation);
+
+      return true;
+    }
+
+    if (await this.connectClaimTokenService.isSignupCtaPosted(conversation._id)) {
+      return true;
+    }
+
+    if (await this.isKeylessDemoCapReached(config, conversation._id)) {
+      await this.postKeylessSignupCta(agentId, config, thread, conversation);
+
+      return true;
+    }
+
+    return false;
+  }
+
   /** Telegram `/start <code>` is control input; when present it is always consumed here. */
   private async consumeTelegramStartLink(
     agentId: string,
     config: ResolvedAgentConfig,
     thread: Thread,
-    message: Message
+    message: Message,
+    messageContext?: MessageContext
   ): Promise<boolean> {
     if (config.platform !== AgentPlatformEnum.TELEGRAM) {
       return false;
     }
 
-    const startToken = extractTelegramStartToken(message.text);
-    if (!startToken) {
-      return false;
+    for (const inbound of [...(messageContext?.skipped ?? []), message]) {
+      const startToken = extractTelegramStartToken(inbound.text);
+      if (startToken) {
+        return this.handleTelegramSubscriberLink(agentId, config, thread, inbound, startToken);
+      }
     }
 
-    return this.handleTelegramSubscriberLink(agentId, config, thread, message, startToken);
+    return false;
   }
 
   /**
@@ -689,171 +789,6 @@ export class AgentInboundHandler implements OnModuleInit {
     return platformThreadId.startsWith('web_chat:') ? platformThreadId.slice('web_chat:'.length) : platformThreadId;
   }
 
-  /** Fail-soft: outbound workflow Message that opened this thread, if any. */
-  private async findWorkflowOriginMessage(
-    agentId: string,
-    config: ResolvedAgentConfig,
-    platformThreadId: string,
-    subscriberId: string | null,
-    message: Message | null = null
-  ): Promise<MessageEntity | null> {
-    if (!subscriberId) {
-      return null;
-    }
-
-    try {
-      const subscriber = await this.subscriberRepository.findBySubscriberId(config.environmentId, subscriberId);
-      if (!subscriber) {
-        return null;
-      }
-
-      if (config.platform === AgentPlatformEnum.EMAIL) {
-        return message ? await this.findEmailWorkflowOriginMessage(agentId, config, subscriber._id, message) : null;
-      }
-
-      const identifier = toProviderMessageLookupKey(platformThreadId);
-
-      return await this.messageRepository.findByAgentIdentifier(
-        config.environmentId,
-        agentId,
-        identifier,
-        subscriber._id
-      );
-    } catch (err) {
-      captureAgentWarning(err, {
-        component: 'agent-inbound-handler',
-        operation: 'lookup-workflow-origin-message',
-        agentId,
-      });
-      this.logger.warn(
-        { err, agentId, platformThreadId },
-        'Failed to look up workflow origin message for conversation hydration'
-      );
-
-      return null;
-    }
-  }
-
-  private async findEmailWorkflowOriginMessage(
-    agentId: string,
-    config: ResolvedAgentConfig,
-    subscriberId: string,
-    message: Message
-  ): Promise<MessageEntity | null> {
-    const originId = extractAgentEmailOriginToken(message);
-    if (!originId) {
-      return null;
-    }
-
-    return this.messageRepository.findOne({
-      _id: originId,
-      _environmentId: config.environmentId,
-      _agentId: agentId,
-      _subscriberId: subscriberId,
-    });
-  }
-
-  /** Fail-soft: write workflow-origin message + signal into conversation history. */
-  private async hydrateWorkflowOrigin(
-    agentId: string,
-    config: ResolvedAgentConfig,
-    conversation: ConversationEntity,
-    platformThreadId: string,
-    originMessage: MessageEntity
-  ): Promise<void> {
-    if (!originMessage._notificationId) {
-      return;
-    }
-
-    let platformMessageId: string | undefined;
-    if (config.platform === AgentPlatformEnum.EMAIL) {
-      platformMessageId = originMessage._id;
-    } else if (originMessage.identifier) {
-      platformMessageId = platformMessageIdFromProviderIdentifier(originMessage.identifier);
-    }
-
-    if (!platformMessageId) {
-      return;
-    }
-
-    try {
-      const { messageContent, signalData } = await this.buildWorkflowOriginContext(
-        originMessage,
-        conversation,
-        config.environmentId,
-        config.organizationId
-      );
-
-      await this.conversationService.persistWorkflowOriginHydration({
-        conversationId: conversation._id,
-        channel: this.conversationService.getPrimaryChannel(conversation),
-        agentIdentifier: config.agentIdentifier,
-        environmentId: config.environmentId,
-        organizationId: config.organizationId,
-        platformMessageId,
-        platformThreadId,
-        messageContent,
-        signalData,
-      });
-    } catch (err) {
-      captureAgentWarning(err, {
-        component: 'agent-inbound-handler',
-        operation: 'hydrate-workflow-origin',
-        agentId,
-      });
-      this.logger.warn(
-        { err, agentId, platformThreadId, messageId: originMessage._id, notificationId: originMessage._notificationId },
-        'Failed to hydrate workflow origin into conversation history'
-      );
-    }
-  }
-
-  private async buildWorkflowOriginContext(
-    originMessage: MessageEntity,
-    conversation: ConversationEntity,
-    environmentId: string,
-    organizationId: string
-  ): Promise<{
-    messageContent: string;
-    signalData: Record<string, unknown>;
-  }> {
-    const notification = await this.notificationRepository.findOne(
-      {
-        _id: originMessage._notificationId,
-        _environmentId: environmentId,
-        _organizationId: organizationId,
-      },
-      'payload'
-    );
-
-    const payload =
-      notification?.payload && typeof notification.payload === 'object' && !Array.isArray(notification.payload)
-        ? (notification.payload as Record<string, unknown>)
-        : {};
-
-    const storedContent = typeof originMessage.content === 'string' ? originMessage.content.trim() : '';
-    const workflowIdentifier = originMessage.templateIdentifier || 'unknown';
-    const messageContent = buildWorkflowOriginSummary(workflowIdentifier, storedContent, payload);
-
-    const subscriberId = conversation.participants.find(
-      (p) => p.type === ConversationParticipantTypeEnum.SUBSCRIBER
-    )?.id;
-
-    return {
-      messageContent,
-      signalData: {
-        notificationId: originMessage._notificationId,
-        jobId: originMessage._jobId,
-        messageId: originMessage._id,
-        transactionId: originMessage.transactionId,
-        workflowIdentifier,
-        stepId: originMessage.stepId,
-        subscriberId,
-        payload,
-      },
-    };
-  }
-
   private async storeInboundAttachments(
     config: ResolvedAgentConfig,
     conversation: ConversationEntity,
@@ -863,13 +798,22 @@ export class AgentInboundHandler implements OnModuleInit {
       return undefined;
     }
 
-    return this.attachmentStorage.storeInbound(message.attachments, {
+    const stored = await this.attachmentStorage.storeInbound(message.attachments, {
       organizationId: config.organizationId,
       environmentId: config.environmentId,
       conversationId: String(conversation._id),
       platformMessageId: message.id ?? `unknown-${Date.now()}`,
       platform: config.platform,
     });
+
+    if (!stored.length) {
+      this.logger.warn(
+        { platform: config.platform, messageId: message.id, inboundCount: message.attachments.length },
+        'Inbound attachments were present but none could be stored'
+      );
+    }
+
+    return stored;
   }
 
   /** Persist the inbound activity, emit analytics, and capture the first platform message id. */
@@ -1272,8 +1216,31 @@ export class AgentInboundHandler implements OnModuleInit {
         : undefined,
     };
 
-    const context = await this.connectionContextResolver.resolve(config, event.raw, platformUserId);
+    const { context, bridgeUrl: bridgeUrlOverride } = await this.connectionContextResolver.resolve(
+      config,
+      event.raw,
+      platformUserId
+    );
     const runtime = this.runtimeResolver.resolve(agent);
+
+    const workflowOriginResolution = await this.workflowOriginService.resolve({
+      agentId,
+      config,
+      platformThreadId: threadId,
+      subscriberId,
+      message: event.message ?? null,
+      existingConversation: conversation,
+      isDirectMessage: event.thread?.isDM,
+    });
+    const workflowOrigin = await this.workflowOriginService.resolveForTurn({
+      agentId,
+      config,
+      conversation,
+      platformThreadId: threadId,
+      subscriberId,
+      resolution: workflowOriginResolution,
+    });
+
     const turn: ConversationTurn = {
       agentId,
       agent: agent ?? { _id: agentId },
@@ -1281,12 +1248,14 @@ export class AgentInboundHandler implements OnModuleInit {
       conversation,
       subscriber,
       context,
+      bridgeUrlOverride,
       subscriberResolution: reactionResolution,
       message: null,
       event: AgentEventEnum.ON_REACTION,
       thread: event.thread ?? ({ id: threadId, channelId: '', isDM: false } as Thread),
       platformThreadId: threadId,
       reaction: reactionPayload,
+      workflowOrigin: workflowOrigin ?? undefined,
     };
 
     // On buttonless platforms (iMessage/SMS) a pending tool approval can be
@@ -1336,9 +1305,15 @@ export class AgentInboundHandler implements OnModuleInit {
       platformThreadId
     );
 
-    const workflowOriginMessage = existingConversation
-      ? null
-      : await this.findWorkflowOriginMessage(agentId, config, platformThreadId, subscriberId);
+    const workflowOriginResolution = await this.workflowOriginService.resolve({
+      agentId,
+      config,
+      platformThreadId,
+      subscriberId,
+      message: null,
+      existingConversation,
+      isDirectMessage: thread.isDM,
+    });
 
     const conversation = await this.conversationService.createOrGetConversation({
       environmentId: config.environmentId,
@@ -1353,16 +1328,21 @@ export class AgentInboundHandler implements OnModuleInit {
       firstMessageText: `[action:${action.id}]`,
       isDirectMessage: thread.isDM,
       workspaceId: extractWorkspaceId(config.platform, rawEvent) ?? undefined,
-      notificationId: workflowOriginMessage?._notificationId,
+      notificationId: workflowOriginResolution?.notificationId,
       contextKeys:
         config.platform === AgentPlatformEnum.WEB_CHAT
           ? ((rawEvent as WebChatRawMessage | undefined)?.contextKeys ?? [])
           : undefined,
     });
 
-    if (workflowOriginMessage) {
-      await this.hydrateWorkflowOrigin(agentId, config, conversation, platformThreadId, workflowOriginMessage);
-    }
+    const workflowOrigin = await this.workflowOriginService.resolveForTurn({
+      agentId,
+      config,
+      conversation,
+      platformThreadId,
+      subscriberId,
+      resolution: workflowOriginResolution,
+    });
 
     trackAgentInboundAction(this.analyticsService, {
       organizationId: config.organizationId,
@@ -1396,11 +1376,16 @@ export class AgentInboundHandler implements OnModuleInit {
       participantType === ConversationParticipantTypeEnum.SUBSCRIBER
         ? ConversationActivitySenderTypeEnum.SUBSCRIBER
         : ConversationActivitySenderTypeEnum.PLATFORM_USER;
-    await this.recordApprovalVerdict(conversation, config, action, actorType, participantId);
+    const identifier = this.readActionIdempotencyKey(rawEvent);
+    await this.recordNonApprovalActionAccept(conversation, config, action, identifier);
 
     // Everything else (incl. mcp-approval:* for managed) routes through the runtime,
     // which owns its own action semantics.
-    const context = await this.connectionContextResolver.resolve(config, rawEvent, userId);
+    const { context, bridgeUrl: bridgeUrlOverride } = await this.connectionContextResolver.resolve(
+      config,
+      rawEvent,
+      userId
+    );
 
     const runtime = this.runtimeResolver.resolve(agent);
     const turn: ConversationTurn = {
@@ -1410,13 +1395,28 @@ export class AgentInboundHandler implements OnModuleInit {
       conversation,
       subscriber,
       context,
+      bridgeUrlOverride,
       subscriberResolution: actionResolution,
       message: null,
       event: AgentEventEnum.ON_ACTION,
       thread,
       platformThreadId,
+      platformUserId: userId,
       action,
+      workflowOrigin: workflowOrigin ?? undefined,
     };
+
+    if (await this.humanConversationInbound.tryHandleAction(turn)) {
+      return;
+    }
+
+    // Record the tool-approval verdict on the transcript, but only when the HITL
+    // path did not already settle a `HumanInteraction` for this click — a settled
+    // row persists the decision through its resume chain, so writing here too
+    // would double-record the verdict.
+    if (!turn.toolApprovalSettledByHitl) {
+      await this.recordApprovalVerdict(conversation, config, action, actorType, participantId, identifier);
+    }
 
     await runtime.dispatch(turn);
   }
@@ -1445,12 +1445,58 @@ export class AgentInboundHandler implements OnModuleInit {
     return null;
   }
 
+  private readActionIdempotencyKey(rawEvent: unknown): string | undefined {
+    if (!rawEvent || typeof rawEvent !== 'object' || Array.isArray(rawEvent)) {
+      return undefined;
+    }
+
+    const key = (rawEvent as { idempotencyKey?: unknown }).idempotencyKey;
+    if (typeof key !== 'string') {
+      return undefined;
+    }
+
+    const trimmed = key.trim();
+
+    return isValidActionIdempotencyKey(trimmed) ? trimmed : undefined;
+  }
+
+  private async recordNonApprovalActionAccept(
+    conversation: ConversationEntity,
+    config: ResolvedAgentConfig,
+    action: AgentAction,
+    identifier?: string
+  ): Promise<void> {
+    if (!identifier || this.parseApprovalVerdict(action.id)) {
+      return;
+    }
+
+    try {
+      await this.conversationService.persistInboundActionAccept({
+        conversationId: conversation._id,
+        channel: this.conversationService.getPrimaryChannel(conversation),
+        agentIdentifier: config.agentIdentifier,
+        environmentId: config.environmentId,
+        organizationId: config.organizationId,
+        identifier,
+        actionId: action.id,
+      });
+    } catch (err) {
+      this.logger.warn(err, `[agent:${config.agentIdentifier}] Failed to persist inbound action accept`);
+      captureAgentWarning(err, {
+        component: 'inbound-turn-handler',
+        operation: 'persist-inbound-action-accept',
+        agentIdentifier: config.agentIdentifier,
+      });
+    }
+  }
+
   private async recordApprovalVerdict(
     conversation: ConversationEntity,
     config: ResolvedAgentConfig,
     action: AgentAction,
     actorType: ConversationActivitySenderTypeEnum.SUBSCRIBER | ConversationActivitySenderTypeEnum.PLATFORM_USER,
-    actorId: string
+    actorId: string,
+    identifier?: string
   ): Promise<void> {
     const verdict = this.parseApprovalVerdict(action.id);
     if (!verdict) {
@@ -1469,6 +1515,7 @@ export class AgentInboundHandler implements OnModuleInit {
         actorId,
         environmentId: config.environmentId,
         organizationId: config.organizationId,
+        ...(identifier ? { identifier } : {}),
       });
     } catch (err) {
       // A failed transcript write must never drop the click — the runtime still

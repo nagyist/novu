@@ -1,10 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import {
   assertSafeOutboundUrl,
+  buildInvalidJsonBodyDetail,
   buildNovuSignatureHeader,
   CreateExecutionDetails,
   CreateExecutionDetailsCommand,
-  CreateStepConditionsPassedDetail,
+  CreateStepConditionEvaluationDetail,
+  createSchemaValidationAjv,
   DetailEnum,
   dashboardSanitizeControlValues,
   evaluateRules,
@@ -25,13 +27,12 @@ import {
   ControlValuesLevelEnum,
   DeliveryLifecycleDetail,
   DeliveryLifecycleStatusEnum,
+  EnvironmentSystemVariables,
   ExecutionDetailsSourceEnum,
   ExecutionDetailsStatusEnum,
   isOutboundSsrfProtectionEnabled,
   ResourceOriginEnum,
 } from '@novu/shared';
-import Ajv from 'ajv';
-import addFormats from 'ajv-formats';
 import { AdditionalOperation, RulesLogic } from 'json-logic-js';
 
 import { ExecuteBridgeJob } from '../execute-bridge-job';
@@ -52,7 +53,7 @@ export class ExecuteHttpRequestStep extends SendMessageType {
     private logger: PinoLogger,
     private getDecryptedSecretKey: GetDecryptedSecretKey,
     private executeBridgeJob: ExecuteBridgeJob,
-    private createStepConditionsPassedDetail: CreateStepConditionsPassedDetail,
+    private createStepConditionEvaluationDetail: CreateStepConditionEvaluationDetail,
     protected messageRepository: MessageRepository,
     protected createExecutionDetails: CreateExecutionDetails
   ) {
@@ -67,18 +68,29 @@ export class ExecuteHttpRequestStep extends SendMessageType {
     const skipRules = getSkipRules(controlValues);
     const shouldSkip = skipRules ? this.evaluateSkipCondition(skipRules, compileContext) : false;
 
-    if (shouldSkip) {
-      await this.createExecutionDetails.execute(
-        CreateExecutionDetailsCommand.create({
-          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
-          detail: DetailEnum.SKIPPED_BRIDGE_EXECUTION,
-          source: ExecutionDetailsSourceEnum.INTERNAL,
-          status: ExecutionDetailsStatusEnum.FAILED,
-          isTest: false,
-          isRetry: false,
-          raw: JSON.stringify({ skip: true }),
+    const wasConditionEvaluationTraced = skipRules
+      ? await this.createStepConditionEvaluationDetail.execute({
+          job: command.job,
+          conditions: skipRules,
+          evaluatedValues: extractRuleVariables(skipRules, compileContext),
+          passed: !shouldSkip,
         })
-      );
+      : false;
+
+    if (shouldSkip) {
+      if (!wasConditionEvaluationTraced) {
+        await this.createExecutionDetails.execute(
+          CreateExecutionDetailsCommand.create({
+            ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+            detail: DetailEnum.SKIPPED_BRIDGE_EXECUTION,
+            source: ExecutionDetailsSourceEnum.INTERNAL,
+            status: ExecutionDetailsStatusEnum.FAILED,
+            isTest: false,
+            isRetry: false,
+            raw: JSON.stringify({ skip: true }),
+          })
+        );
+      }
 
       return {
         status: SendMessageStatus.SKIPPED,
@@ -87,14 +99,6 @@ export class ExecuteHttpRequestStep extends SendMessageType {
           detail: DeliveryLifecycleDetail.USER_STEP_CONDITION,
         },
       };
-    }
-
-    if (skipRules) {
-      await this.createStepConditionsPassedDetail.execute({
-        job: command.job,
-        conditions: skipRules,
-        evaluatedValues: extractRuleVariables(skipRules, compileContext),
-      });
     }
 
     const { skip: _skip, ...controlValuesWithoutSkip } = controlValues;
@@ -137,8 +141,6 @@ export class ExecuteHttpRequestStep extends SendMessageType {
     const method = (compiled.method as string) ?? 'POST';
     const rawHeaders = (compiled.headers as Array<{ key: string; value: string }> | undefined) ?? [];
     const compiledBody = compiled.body as string | Array<{ key: string; value: string }> | undefined;
-    const rawBody =
-      typeof compiledBody === 'string' && compiledBody.trim() ? repairJsonString(compiledBody) : compiledBody;
     const timeout = (compiled.timeout as number | undefined) ?? 5000;
 
     if (!url) {
@@ -191,10 +193,12 @@ export class ExecuteHttpRequestStep extends SendMessageType {
 
     let bodyObject: Record<string, unknown> | unknown[] | undefined;
     try {
+      // `repairJsonString` throws on bodies it cannot repair, so it has to stay inside this
+      // try/catch to surface the failure as an execution detail instead of an unhandled job error.
+      const rawBody =
+        typeof compiledBody === 'string' && compiledBody.trim() ? repairJsonString(compiledBody) : compiledBody;
       bodyObject = resolveHttpRequestBody(rawBody);
     } catch (parseError) {
-      const errorMessage = parseError instanceof Error ? parseError.message : 'Failed to parse raw JSON body';
-
       await this.createExecutionDetails.execute(
         CreateExecutionDetailsCommand.create({
           ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
@@ -203,7 +207,9 @@ export class ExecuteHttpRequestStep extends SendMessageType {
           status: ExecutionDetailsStatusEnum.FAILED,
           isTest: false,
           isRetry: false,
-          raw: JSON.stringify({ error: `Invalid raw JSON body: ${errorMessage}` }),
+          raw: JSON.stringify(
+            buildInvalidJsonBodyDetail(parseError, compiledBody, collectSecretEnvValues(command.compileContext?.env))
+          ),
         })
       );
 
@@ -333,9 +339,7 @@ export class ExecuteHttpRequestStep extends SendMessageType {
     schema: Record<string, unknown>
   ): { isValid: true; errors?: undefined } | { isValid: false; errors: { path: string; message: string }[] } {
     try {
-      const ajv = new Ajv({ strict: false });
-      addFormats(ajv);
-      const validate = ajv.compile(schema);
+      const validate = createSchemaValidationAjv({ schema }).compile(schema);
       const valid = validate(responseBody);
 
       if (valid) {
@@ -424,6 +428,26 @@ export class ExecuteHttpRequestStep extends SendMessageType {
 
     return rawControls;
   }
+}
+
+/**
+ * Compile-safe: adding a field to EnvironmentSystemVariables will cause a TS error here.
+ */
+const SYSTEM_ENV_KEYS: Record<keyof EnvironmentSystemVariables, true> = { name: true, type: true };
+
+/**
+ * `env` merges decrypted environment variables, which can hold API keys and tokens, with the
+ * environment's system variables. Only the user-defined values are treated as secrets: the system
+ * values are not sensitive, and masking strings as common as `prod` would gut the excerpt.
+ */
+function collectSecretEnvValues(env: unknown): string[] {
+  if (!env || typeof env !== 'object') {
+    return [];
+  }
+
+  return Object.entries(env as Record<string, unknown>)
+    .filter(([key, value]) => !(key in SYSTEM_ENV_KEYS) && typeof value === 'string' && value.length > 0)
+    .map(([, value]) => value as string);
 }
 
 function getSkipRules(controlValues: Record<string, unknown>): RulesLogic<AdditionalOperation> | undefined {

@@ -63,6 +63,7 @@ export enum FeatureFlagsKeysEnum {
   IS_TRACE_LOGS_ENABLED = 'IS_TRACE_LOGS_ENABLED',
   IS_TRACE_LOGS_READ_ENABLED = 'IS_TRACE_LOGS_READ_ENABLED',
   IS_INBOUND_WEBHOOKS_ENABLED = 'IS_INBOUND_WEBHOOKS_ENABLED',
+  IS_INBOUND_WEBHOOK_ATTACHMENT_URLS_ENABLED = 'IS_INBOUND_WEBHOOK_ATTACHMENT_URLS_ENABLED',
   IS_INBOUND_WEBHOOKS_CONFIGURATION_ENABLED = 'IS_INBOUND_WEBHOOKS_CONFIGURATION_ENABLED',
   IS_STEP_RUN_LOGS_READ_ENABLED = 'IS_STEP_RUN_LOGS_READ_ENABLED',
   IS_STEP_RUN_LOGS_WRITE_ENABLED = 'IS_STEP_RUN_LOGS_WRITE_ENABLED',
@@ -105,12 +106,17 @@ export enum FeatureFlagsKeysEnum {
   IS_MANAGED_AGENT_RUNTIME_ENABLED = 'IS_MANAGED_AGENT_RUNTIME_ENABLED',
   /** Enable Novu-managed demo Claude provider auto-provisioned on dev environments. Create the boolean in LaunchDarkly for cloud, or set `VITE_IS_DEMO_MANAGED_CLAUDE_ENABLED` when self-hosted. */
   IS_DEMO_MANAGED_CLAUDE_ENABLED = 'IS_DEMO_MANAGED_CLAUDE_ENABLED',
-  /** Route managed-agent StreamParts through AgentEvent mapper + sink. Create boolean in LaunchDarkly for cloud, or set env for self-hosted. */
-  IS_AGENT_EVENT_PROTOCOL_ENABLED = 'IS_AGENT_EVENT_PROTOCOL_ENABLED',
   /**
-   * Enable the agent web-chat channel (subscriber `/v1/web-chat/*`, useAgentChat wayfinder).
+   * Enable framework `ctx.ask` / `ctx.approve` / `ctx.choose` / `ctx.tell` human
+   * interactions delivered into the agent conversation. Create the boolean in
+   * LaunchDarkly for cloud, or set `IS_AGENT_HUMAN_HITL_ENABLED` when self-hosted.
+   */
+  IS_AGENT_HUMAN_HITL_ENABLED = 'IS_AGENT_HUMAN_HITL_ENABLED',
+  /**
+   * Enable the Web Chat channel (subscriber `/v1/web-chat/*`, useWebChat wayfinder).
    * Requires conversational agents. Create the boolean in LaunchDarkly for cloud, or set
    * `IS_AGENT_WEB_CHAT_ENABLED` when self-hosted (`VITE_IS_AGENT_WEB_CHAT_ENABLED` for dashboard).
+   * Flag key kept as IS_AGENT_WEB_CHAT_ENABLED (LaunchDarkly / env already deployed).
    */
   IS_AGENT_WEB_CHAT_ENABLED = 'IS_AGENT_WEB_CHAT_ENABLED',
   /** Enable the "What's next" section on the agent overview. Create the boolean in LaunchDarkly for cloud, or set `VITE_IS_AGENT_WHATS_NEXT_ENABLED` when self-hosted. */
@@ -170,14 +176,15 @@ export enum FeatureFlagsKeysEnum {
    */
   IS_PAYLOAD_DEDUP_ENABLED = 'IS_PAYLOAD_DEDUP_ENABLED',
   /**
-   * Emit a "step conditions matched" execution detail when a step's conditions
-   * pass and the step executes (v2 skip conditions, HTTP Request steps, and
-   * legacy v1 filters including webhook filters). When off, condition results
-   * are only persisted when a step is skipped. Create the boolean in
-   * LaunchDarkly for cloud, or set `IS_STEP_CONDITIONS_PASSED_TRACE_ENABLED`
-   * when self-hosted.
+   * Trace step condition evaluation in the activity feed regardless of outcome:
+   * a "step conditions matched" detail when conditions pass, and a "step was
+   * skipped based on steps conditions" detail when they do not (v2 skip
+   * conditions, HTTP Request steps, and legacy v1 filters including webhook
+   * filters). Legacy v1 skipped steps still persist their skip detail when
+   * this flag is off. Create the boolean in LaunchDarkly for cloud, or set
+   * `IS_STEP_CONDITIONS_EVALUATION_TRACE_ENABLED` when self-hosted.
    */
-  IS_STEP_CONDITIONS_PASSED_TRACE_ENABLED = 'IS_STEP_CONDITIONS_PASSED_TRACE_ENABLED',
+  IS_STEP_CONDITIONS_EVALUATION_TRACE_ENABLED = 'IS_STEP_CONDITIONS_EVALUATION_TRACE_ENABLED',
   /**
    * Stop embedding the fully populated workflow step (message template
    * `content`, `controls`, `cta`, `variables`, variants' templates, `output`
@@ -211,6 +218,14 @@ export enum FeatureFlagsKeysEnum {
    */
   IS_SUBSCRIBER_CHAT_OAUTH_HMAC_REQUIRED_ENABLED = 'IS_SUBSCRIBER_CHAT_OAUTH_HMAC_REQUIRED_ENABLED',
 
+  /**
+   * Route job delays longer than the SQS 900s per-message cap through
+   * EventBridge Scheduler instead of BullMQ. Only consulted once
+   * `QUEUE_BACKEND_MODE` has SQS as the primary backend; when false (default)
+   * long delays keep going to BullMQ.
+   */
+  IS_EVENTBRIDGE_SCHEDULER_ENABLED = 'IS_EVENTBRIDGE_SCHEDULER_ENABLED',
+
   // String flags
   QUEUE_BACKEND_MODE = 'QUEUE_BACKEND_MODE', // Values: "bullmq" | "shadow" | "live" | "complete"
   USAGE_REPORT_TRIGGER_SECRET = 'USAGE_REPORT_TRIGGER_SECRET',
@@ -228,6 +243,13 @@ export enum FeatureFlagsKeysEnum {
   MAX_SUBSCRIBER_DEVICE_TOKENS_NUMBER = 'MAX_SUBSCRIBER_DEVICE_TOKENS_NUMBER',
   MAX_ENVIRONMENT_VARIABLES_LIMIT_NUMBER = 'MAX_ENVIRONMENT_VARIABLES_LIMIT_NUMBER',
   MAX_STEP_RESOLVERS_NUMBER = 'MAX_STEP_RESOLVERS_NUMBER',
+  /**
+   * Max conditions (or nested groups) allowed in a single step-conditions group.
+   * Default is 10 when the flag is unset, invalid, or below 1. Create the number
+   * in LaunchDarkly for cloud, or set `VITE_MAX_STEP_CONDITIONS_PER_GROUP_NUMBER`
+   * when self-hosted.
+   */
+  MAX_STEP_CONDITIONS_PER_GROUP_NUMBER = 'MAX_STEP_CONDITIONS_PER_GROUP_NUMBER',
   MAX_DOMAINS_LIMIT_NUMBER = 'MAX_DOMAINS_LIMIT_NUMBER',
   MAX_AGENTS_LIMIT_NUMBER = 'MAX_AGENTS_LIMIT_NUMBER',
   MAX_CUSTOM_EMAIL_DOMAINS_NUMBER = 'MAX_CUSTOM_EMAIL_DOMAINS_NUMBER',
